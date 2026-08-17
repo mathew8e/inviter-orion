@@ -4,8 +4,8 @@ This is a Chrome browser extension named "FB Auto Inviter". Its purpose is to au
 
 ## Main Technologies
 
-*   **Frontend:** HTML, CSS, JavaScript
-*   **Browser APIs:** Chrome Extension APIs (Manifest V3) including `chrome.scripting`, `chrome.storage`, and `chrome.runtime`.
+- **Frontend:** HTML, CSS, JavaScript
+- **Browser APIs:** Chrome Extension APIs (Manifest V3) including `chrome.scripting`, `chrome.storage`, and `chrome.runtime`.
 
 ## Architecture
 
@@ -33,9 +33,11 @@ To use the extension:
 
 ## Development Conventions
 
-*   **Code Style:** The project uses plain JavaScript with no transpilers or bundlers.
-*   **State Management:** The running state (`isRunning`) is managed via `chrome.storage.local` to persist across popup closures.
-*   **Communication:** The popup, background script, and content script communicate using `chrome.runtime.sendMessage` and `chrome.runtime.onMessage`.
-*   **Core Logic:** The main automation logic is located in the `autoInviteAction` async function within `popup.js`.
-*   **Scrolling Logic:** The script identifies a scrollable element (ideally a dialog box) and iteratively invites visible users, then scrolls down to load more. It stops when it reaches the end of the list, the invitation limit is met, or the user stops it.
-*   **Debugging:** The content script includes `console.log` statements for debugging the scroll element detection and invitation process. It also visually highlights the detected scrollable element with a red border during its operation.
+- **Code Style:** The project uses plain JavaScript with no transpilers or bundlers.
+- **State Management:** The running state (`isRunning`) is managed via `chrome.storage.local` to persist across popup closures.
+- **Communication:** The popup, background script, and content script communicate using `chrome.runtime.sendMessage` and `chrome.runtime.onMessage`.
+- **Core Logic:** The main automation logic is located in the `autoInviteAction` async function within `popup.js`.
+- **Scrolling Logic:** The script identifies a scrollable element (ideally a dialog box) and iteratively invites visible users, then scrolls down to load more. It stops when it reaches the end of the list, the invitation limit is met, or the user stops it.
+- **Debugging:** The content script includes `console.log` statements for debugging the scroll element detection and invitation process. It also visually highlights the detected scrollable element with a red border during its operation.
+
+git change
