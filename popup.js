@@ -1,298 +1,261 @@
-const statusEl = document.getElementById("status");
-const startBtn = document.getElementById("startBtn");
-const stopBtn = document.getElementById("stopBtn");
-const historyListEl = document.querySelector("#history ul");
-function getConsecutiveNoNewButtonsMax() {
-    const el = document.getElementById("noButton");
-    const val = el ? parseInt(el.value, 10) : NaN;
-    return Number.isFinite(val) ? val : 5; // default to 5 if not present or invalid
+// The popup only renders state and sends intents. background.js owns the
+// truth, so a run that ends while the popup is closed is still recorded.
+
+const el = (id) => document.getElementById(id);
+
+// Callback form is supported everywhere; promise-returning chrome.storage is
+// not guaranteed on Orion, which is the browser this actually ships to.
+const storageGet = (keys) => new Promise((resolve) => chrome.storage.local.get(keys, resolve));
+const statusEl = el("status");
+const bandTextEl = el("bandText");
+const countEl = el("count");
+const startBtn = el("startBtn");
+const stopBtn = el("stopBtn");
+const historyBody = el("historyBody");
+
+const BAND_TEXT = {
+    idle: "Připraveno",
+    running: "Běží",
+    stopping: "Zastavuji",
+    done: "Hotovo",
+    stopped: "Zastaveno",
+    error: "Přerušeno",
+};
+
+const TAG_TEXT = { done: "Hotovo", stopped: "Stop", interrupted: "Chyba" };
+
+// --- Rendering ---------------------------------------------------------
+
+function renderCount(count) {
+    const n = Number(count) || 0;
+    const padded = String(n).padStart(4, "0");
+    const lead = padded.length - String(n).length;
+    countEl.innerHTML = lead
+        ? `<span class="lead">${padded.slice(0, lead)}</span>${padded.slice(lead)}`
+        : padded;
 }
 
-// --- History Functions ---
-function loadHistory() {
-    if (!historyListEl) return;
-    historyListEl.innerHTML = ""; // Clear existing list
-    chrome.storage.local.get("invitationHistory", (data) => {
-        if (data.invitationHistory && data.invitationHistory.length > 0) {
-            // Sort history from newest to oldest
-            const sortedHistory = data.invitationHistory.sort(
-                (a, b) => new Date(b.date) - new Date(a.date),
-            );
+function renderState(state) {
+    const kind = state.statusKind || "idle";
+    const active = kind === "running" || kind === "stopping";
 
-            sortedHistory.forEach((item) => {
-                const li = document.createElement("li");
-                const date = new Date(item.date);
-                // Format date to be more readable, e.g., "Feb 03 2026, 10:30"
-                const formattedDate = `${date.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}, ${date.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}`;
-                li.textContent = `${formattedDate} - Invited ${item.count}`;
-                historyListEl.appendChild(li);
+    document.body.dataset.state = kind;
+    bandTextEl.textContent = BAND_TEXT[kind] || BAND_TEXT.idle;
+    statusEl.textContent = state.statusText || "Otevři seznam reakcí a spusť.";
+    renderCount(state.count);
+
+    startBtn.disabled = active;
+    stopBtn.disabled = !active;
+}
+
+function renderHistory(history) {
+    historyBody.innerHTML = "";
+
+    if (!history || !history.length) {
+        const row = historyBody.insertRow();
+        const cell = row.insertCell();
+        cell.colSpan = 3;
+        cell.className = "empty";
+        cell.textContent = "Zatím žádné běhy.";
+        return;
+    }
+
+    [...history].reverse().forEach((item) => {
+        const date = new Date(item.date);
+        const row = historyBody.insertRow();
+
+        const when = row.insertCell();
+        when.innerHTML =
+            `<span class="date">${date.toLocaleDateString("cs-CZ", { day: "numeric", month: "short" })}</span> ` +
+            `<span class="time">${date.toLocaleTimeString("cs-CZ", { hour: "2-digit", minute: "2-digit" })}</span>`;
+
+        const count = row.insertCell();
+        count.className = "num";
+        count.textContent = item.count;
+
+        const reason = item.reason || "done";
+        const end = row.insertCell();
+        end.className = "end";
+        end.innerHTML = `<span class="tag ${reason}">${TAG_TEXT[reason] || reason}</span>`;
+    });
+}
+
+async function refresh() {
+    const data = await storageGet([
+        "isRunning",
+        "count",
+        "statusText",
+        "statusKind",
+        "invitationHistory",
+    ]);
+    renderState(data);
+    renderHistory(data.invitationHistory);
+}
+
+// --- Liveness check ----------------------------------------------------
+
+// A run marked active whose page no longer has the script alive (tab closed,
+// reloaded, or navigated away) never gets to send FINISHED. Catch that on
+// open so the panel can't sit on a stale "running".
+async function reconcileStaleRun() {
+    const { isRunning, runTabId, count } = await storageGet(["isRunning", "runTabId", "count"]);
+    if (!isRunning) return;
+
+    let alive = false;
+    if (runTabId != null) {
+        try {
+            const [{ result }] = await chrome.scripting.executeScript({
+                target: { tabId: runTabId },
+                func: () => window.__inviter_running === true,
             });
-        } else {
-            const li = document.createElement("li");
-            li.textContent = "No history yet.";
-            historyListEl.appendChild(li);
+            alive = result === true;
+        } catch {
+            alive = false; // tab is gone or not scriptable
         }
-    });
+    }
+
+    if (!alive) {
+        chrome.runtime.sendMessage({ type: "RECONCILE_DEAD_RUN", count: count || 0 });
+    }
 }
 
-function saveHistory(count) {
-    const newEntry = { date: new Date().toISOString(), count: count };
-    chrome.storage.local.get("invitationHistory", (data) => {
-        let history = data.invitationHistory || [];
-        history.push(newEntry);
-        // Keep only the last 10 entries
-        if (history.length > 10) {
-            history = history.slice(history.length - 10);
-        }
-        chrome.storage.local.set({ invitationHistory: history }, () => {
-            loadHistory(); // Refresh the list after saving
-        });
-    });
-}
+// --- Events ------------------------------------------------------------
 
-// --- Initial UI Setup ---
-function initializeUI() {
-    if (startBtn) startBtn.disabled = false;
-    if (stopBtn) stopBtn.disabled = true;
-
-    chrome.storage.local.get("isRunning", (data) => {
-        if (data.isRunning) {
-            if (statusEl) statusEl.textContent = "Currently running...";
-            if (startBtn) startBtn.disabled = true;
-            if (stopBtn) stopBtn.disabled = false;
-        } else {
-            if (statusEl) statusEl.textContent = "Ready to start.";
-            if (startBtn) startBtn.disabled = false;
-            if (stopBtn) stopBtn.disabled = true;
-        }
-    });
-
-    loadHistory();
-}
-
-// --- Event Listeners ---
-// Listen for storage changes to update UI (e.g., when script finishes in background)
 chrome.storage.onChanged.addListener((changes, namespace) => {
-    if (namespace === "local" && changes.isRunning) {
-        const { newValue } = changes.isRunning;
-        if (newValue) {
-            if (statusEl) statusEl.textContent = "Currently running...";
-            if (startBtn) startBtn.disabled = true;
-            if (stopBtn) stopBtn.disabled = false;
-        } else {
-            if (statusEl) statusEl.textContent = "Finished.";
-            if (startBtn) startBtn.disabled = false;
-            if (stopBtn) stopBtn.disabled = true;
-        }
+    if (namespace !== "local") return;
+    if (changes.invitationHistory) renderHistory(changes.invitationHistory.newValue);
+    if (changes.statusKind || changes.statusText || changes.count) refresh();
+});
+
+const delaySlider = el("delay");
+delaySlider.addEventListener("input", (e) => {
+    el("delayValue").textContent = `${String(e.target.value).replace(".", ",")} s`;
+});
+
+el("clearHistoryBtn").addEventListener("click", () => {
+    chrome.runtime.sendMessage({ type: "CLEAR_HISTORY" });
+});
+
+startBtn.addEventListener("click", async () => {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab || !tab.id) {
+        statusEl.textContent = "Není aktivní karta, na které by šlo spustit.";
+        return;
+    }
+
+    chrome.runtime.sendMessage({ type: "START", tabId: tab.id });
+
+    const num = (id, fallback) => {
+        const v = parseFloat(el(id).value);
+        return Number.isFinite(v) ? v : fallback;
+    };
+
+    try {
+        await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            func: () => {
+                window.__inviter_stop = false;
+                window.__inviter_running = true;
+            },
+        });
+
+        await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            func: autoInviteAction,
+            args: [
+                el("string").value || "Pozvat",
+                num("delay", 0.5),
+                num("limit", 1000),
+                num("pauseAfter", 200),
+                num("noButton", 5),
+                num("scrollDelay", 500),
+            ],
+        });
+    } catch (err) {
+        chrome.runtime.sendMessage({ type: "FINISHED", count: 0, stopped: true });
+        statusEl.textContent = `Nepodařilo se spustit: ${err?.message || "neznámá chyba"}`;
     }
 });
 
-// Listen for messages from the content script
-chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-    switch (request.type) {
-        case "UPDATE_COUNT":
-            const invitedCountEl = document.getElementById("invitedCount");
-            if (invitedCountEl) invitedCountEl.textContent = request.count;
-            break;
-        case "LOG":
-            if (statusEl) statusEl.innerHTML = request.message;
-            break;
-        case "NO_BUTTONS_FOUND":
-            if (statusEl)
-                statusEl.innerHTML = `No buttons found. Please check the button text.`;
-            break;
-        case "FINISHED":
-            const message = request.stopped
-                ? `Stopped by user. Invited ${request.count} people.`
-                : `Finished. Invited ${request.count} people.`;
-            if (statusEl) statusEl.textContent = message;
-            saveHistory(request.count);
-            chrome.runtime.sendMessage({ type: "STOP" }); // Tell background to set isRunning to false
-            break;
+stopBtn.addEventListener("click", async () => {
+    chrome.runtime.sendMessage({ type: "STOP_REQUEST" });
+
+    const { runTabId } = await storageGet("runTabId");
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    const tabId = runTabId ?? tab?.id;
+    if (tabId == null) return;
+
+    try {
+        await chrome.scripting.executeScript({
+            target: { tabId },
+            func: () => {
+                window.__inviter_stop = true;
+            },
+        });
+    } catch {
+        // Page is gone — the liveness check will settle the state.
+        chrome.runtime.sendMessage({ type: "RECONCILE_DEAD_RUN", count: 0 });
     }
 });
 
-// Update delay value display
-const delaySlider = document.getElementById("delay");
-const delayValueEl = document.getElementById("delayValue");
-if (delaySlider && delayValueEl) {
-    delaySlider.addEventListener("input", (e) => {
-        delayValueEl.textContent = e.target.value;
-    });
-}
+document.addEventListener("DOMContentLoaded", async () => {
+    await reconcileStaleRun();
+    refresh();
+});
 
-const pcModeBtn = document.getElementById("pcModeBtn");
-if (pcModeBtn) {
-    pcModeBtn.addEventListener("click", () => {
-        document.body.classList.add("pc-mode");
-        pcModeBtn.style.display = "none";
-    });
-}
+// --- Injected into the Facebook page -----------------------------------
 
-// --- Button Actions ---
-if (startBtn) {
-    startBtn.addEventListener("click", async () => {
-        if (statusEl) statusEl.textContent = "Starting...";
-        chrome.runtime.sendMessage({ type: "START" });
+async function autoInviteAction(inputString, delay, limit, pauseAfter, consecutiveNoNewButtonsMax, scrollDelay) {
+    const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
-        let [tab] = await chrome.tabs.query({
-            active: true,
-            currentWindow: true,
-        });
-        if (!tab || !tab.id) {
-            if (statusEl) statusEl.textContent = "No active tab to run on.";
-            chrome.runtime.sendMessage({ type: "STOP" });
-            return;
-        }
-
-        const inputValue = document.getElementById("string").value || "Pozvat";
-        const delay = document.getElementById("delay").value || "0.5";
-        const limit = document.getElementById("limit").value || "1000";
-        const pauseAfter = document.getElementById("pauseAfter").value || "200";
-        const consecutiveNoNewButtonsMax = getConsecutiveNoNewButtonsMax();
-
-        // Helper to decide search string based on user input or common defaults
-        let searchString = inputValue;
-        // If the user hasn't changed the default Czech "Pozvat", we also check for "Follow" or "Invite"
-        // But the script uses the exact inputString provided to the function. 
-        // We'll pass the input as is, but the content script logic can be more flexible.
-
+    // Messaging must never take the run down with it: the popup may be
+    // closed and the service worker asleep.
+    const send = (msg) => {
         try {
-            await chrome.scripting.executeScript({
-                target: { tabId: tab.id },
-                func: () => {
-                    window.__inviter_stop = false;
-                    window.__inviter_running = true;
-                },
-            });
-
-            if (statusEl) statusEl.textContent = "Running invites...";
-
-            await chrome.scripting.executeScript({
-                target: { tabId: tab.id },
-                func: autoInviteAction,
-                args: [
-                    inputValue,
-                    delay,
-                    limit,
-                    pauseAfter,
-                    consecutiveNoNewButtonsMax,
-                ],
-            });
-        } catch (err) {
-            console.error("executeScript failed:", err);
-            if (statusEl)
-                statusEl.textContent =
-                    "Error: " + (err ? err.message : "Unknown error");
-            chrome.runtime.sendMessage({ type: "STOP" });
+            chrome.runtime.sendMessage(msg, () => void chrome.runtime.lastError);
+        } catch (e) {
+            console.warn("inviter: message failed", e);
         }
-    });
-}
+    };
 
-if (stopBtn) {
-    stopBtn.addEventListener("click", async () => {
-        if (statusEl) statusEl.textContent = "Stopping...";
-        chrome.runtime.sendMessage({ type: "STOP" });
+    // NOTES.md #2: the list is virtualised, so a quick "nothing new" check
+    // lies. Scroll fast, but once it looks finished, confirm slowly before
+    // believing it.
+    const SETTLE_WAIT_MS = 2000;
+    const SETTLE_CHECKS = 2;
 
-        let [tab] = await chrome.tabs.query({
-            active: true,
-            currentWindow: true,
-        });
-        if (!tab || !tab.id) {
-            if (statusEl) statusEl.textContent = "No active tab to stop on.";
-            return;
-        }
-        try {
-            await chrome.scripting.executeScript({
-                target: { tabId: tab.id },
-                func: () => {
-                    window.__inviter_stop = true;
-                },
-            });
-        } catch (err) {
-            console.error("Failed to set stop flag:", err);
-        }
-    });
-}
+    send({ type: "LOG", message: "Spouštím…" });
 
-// --- Main execution ---
-document.addEventListener("DOMContentLoaded", initializeUI);
-
-// This function runs INSIDE the Facebook page
-async function autoInviteAction(
-    inputString,
-    delay,
-    limit,
-    pauseAfter,
-    consecutiveNoNewButtonsMax,
-) {
-    // This is now hardcoded to false as the UI element was removed.
-    const isMobile = false;
-
-    consecutiveNoNewButtonsMax = parseInt(consecutiveNoNewButtonsMax, 10);
-    if (!Number.isFinite(consecutiveNoNewButtonsMax)) {
-        consecutiveNoNewButtonsMax = 5;
-    }
-
-    chrome.runtime.sendMessage({ type: "LOG", message: "Script starting..." });
-
-    const desktopSelectors = [
+    const selectors = [
         'div[aria-label="Pozvat"][role="button"]',
         'div[aria-label^="Pozvat"][role="button"]',
         'div[aria-label="Sledovat"][role="button"]',
         'div[aria-label="Follow"][role="button"]',
-        `div[role="button"]`, // Fallback
+        'div[role="button"]', // fallback
     ];
 
-    const mobileSelectors = [
-        // Kept for potential future use, but currently unused
-        'button[data-testid="user-list-invite-button"]',
-        'div[aria-label="Pozvat"]',
-        'div[aria-label="Invite"]',
-        "button",
-    ];
-
-    const selectors = isMobile ? mobileSelectors : desktopSelectors;
-
-    // --- Scrollable Element Detection v4 (User-Initiated) ---
-    chrome.runtime.sendMessage({
-        type: "LOG",
-        message: "Please click an 'Invite' button to begin.",
-    });
+    send({ type: "LOG", message: "Klikni na tlačítko Pozvat, ať vím, kde je seznam." });
 
     const anchorButton = await new Promise((resolve) => {
         const clickListener = (event) => {
-            const targetElement = event.target.closest(
-                'div[role="button"], button',
-            );
+            const targetElement = event.target.closest('div[role="button"], button');
+            if (!targetElement) return;
 
-            if (targetElement) {
-                const label =
-                    targetElement.getAttribute("aria-label") ||
-                    targetElement.textContent ||
-                    "";
-                const keywords = ["invite", "pozvat", "sledovat", "follow"];
+            const label = targetElement.getAttribute("aria-label") || targetElement.textContent || "";
+            const keywords = ["invite", "pozvat", "sledovat", "follow"];
 
-                if (keywords.some((k) => label.toLowerCase().includes(k))) {
-                    console.log(
-                        "User clicked a potential invite button:",
-                        targetElement,
-                    );
-                    event.preventDefault();
-                    event.stopPropagation();
-                    event.stopImmediatePropagation();
-                    document.removeEventListener("click", clickListener, true);
-                    resolve(targetElement);
-                }
+            if (keywords.some((k) => label.toLowerCase().includes(k))) {
+                event.preventDefault();
+                event.stopPropagation();
+                event.stopImmediatePropagation();
+                document.removeEventListener("click", clickListener, true);
+                resolve(targetElement);
             }
         };
         document.addEventListener("click", clickListener, true);
     });
 
-    chrome.runtime.sendMessage({
-        type: "LOG",
-        message: "Anchor button selected. Finding scrollable area...",
-    });
+    send({ type: "LOG", message: "Mám seznam. Hledám scrollovatelnou oblast…" });
 
     let scrollableElement = null;
     let originalBorderStyle = "";
@@ -304,69 +267,47 @@ async function autoInviteAction(
             const style = window.getComputedStyle(parent);
             if (style.overflowY === "scroll" || style.overflowY === "auto") {
                 scrollableElement = parent;
-                chrome.runtime.sendMessage({
-                    type: "LOG",
-                    message: "Scrollable area found.",
-                });
                 break;
             }
             parent = parent.parentElement;
         }
-        if (!scrollableElement) {
-            scrollableElement = dialog;
-        }
+        if (!scrollableElement) scrollableElement = dialog;
     } else {
         scrollableElement = document.body;
     }
 
-    if (scrollableElement) {
-        originalBorderStyle = scrollableElement.style.border;
-        scrollableElement.style.border = "3px solid red";
-    }
+    originalBorderStyle = scrollableElement.style.border;
+    scrollableElement.style.border = "3px solid #DC5314";
 
-    if (typeof window.__inviter_stop === "undefined") {
-        window.__inviter_stop = false;
-    }
+    if (typeof window.__inviter_stop === "undefined") window.__inviter_stop = false;
     window.__inviter_running = true;
 
     let count = 0;
-    const maxInvites = parseInt(limit, 10);
-    const pauseAfterInvites = parseInt(pauseAfter, 10);
-    const delaySeconds = parseFloat(delay);
-    let lastScrollHeight = -1;
+    const maxInvites = limit;
+    const pauseAfterInvites = pauseAfter;
+    const delaySeconds = delay;
+    const scrollWaitMs = scrollDelay;
     let consecutiveNoNewButtons = 0;
 
     while (!window.__inviter_stop && count < maxInvites) {
         let currentVisibleButtons = [];
+        const searchText = inputString.trim().toLowerCase();
+
         for (const selector of selectors) {
-            const foundButtons = Array.from(
-                document.querySelectorAll(
-                    `${selector}:not([data-invited="true"])`,
-                ),
-            );
+            const found = Array.from(
+                document.querySelectorAll(`${selector}:not([data-invited="true"])`),
+            ).filter((btn) => (btn.textContent || "").trim().toLowerCase() === searchText);
 
-            const searchText = inputString.trim().toLowerCase();
-            let filteredButtons = foundButtons.filter(
-                (btn) =>
-                    (btn.textContent || "").trim().toLowerCase() === searchText,
-            );
-
-            if (filteredButtons.length > 0) {
-                currentVisibleButtons = filteredButtons;
-                chrome.runtime.sendMessage({
-                    type: "LOG",
-                    message: `Found ${currentVisibleButtons.length} buttons.`,
-                });
+            if (found.length > 0) {
+                currentVisibleButtons = found;
+                send({ type: "LOG", message: `Nalezeno ${found.length} tlačítek.` });
                 break;
             }
         }
 
         if (currentVisibleButtons.length === 0) {
             consecutiveNoNewButtons++;
-            chrome.runtime.sendMessage({
-                type: "LOG",
-                message: "No new buttons found. Scrolling...",
-            });
+            send({ type: "LOG", message: "Nic nového, scrolluji…" });
         } else {
             consecutiveNoNewButtons = 0;
         }
@@ -376,61 +317,57 @@ async function autoInviteAction(
 
             btn.dataset.invited = "true";
 
-            const randomDelay = Math.random() * delaySeconds * 1000 + 500; // Add 0.5s base
-            await new Promise((res) => setTimeout(res, randomDelay));
+            // Invite pacing stays conservative — this is the rate-limit
+            // surface (NOTES.md #3), not the scrolling.
+            await sleep(Math.random() * delaySeconds * 1000 + 500);
 
-            btn.scrollIntoView({ behavior: "smooth", block: "center" });
-            await new Promise((res) => setTimeout(res, 200));
+            btn.scrollIntoView({ block: "center" });
+            await sleep(80);
 
-            if (!document.body.contains(btn)) {
-                console.warn("Button vanished, skipping.");
-                continue;
-            }
+            if (!document.body.contains(btn)) continue;
 
             try {
                 btn.click();
-                btn.style.backgroundColor = "#4CAF50"; // Green
+                btn.style.backgroundColor = "#3F7A4A";
                 count++;
-                chrome.runtime.sendMessage({
-                    type: "UPDATE_COUNT",
-                    count: count,
-                });
-            } catch (e) {
-                btn.style.backgroundColor = "#F44336"; // Red
+                send({ type: "UPDATE_COUNT", count });
+            } catch {
+                btn.style.backgroundColor = "#A32F28";
             }
 
             if (count > 0 && count % pauseAfterInvites === 0) {
-                chrome.runtime.sendMessage({
-                    type: "LOG",
-                    message: `Paused for 30s after ${count} invites.`,
-                });
-                await new Promise((res) => setTimeout(res, 30000));
+                send({ type: "LOG", message: `Pauza 30 s po ${count} pozvánkách.` });
+                await sleep(30000);
             }
         }
 
-        lastScrollHeight = scrollableElement.scrollHeight;
+        const heightBefore = scrollableElement.scrollHeight;
         scrollableElement.scrollTop = scrollableElement.scrollHeight;
-        await new Promise((res) => setTimeout(res, 2000));
+        await sleep(scrollWaitMs);
 
         if (
-            scrollableElement.scrollHeight === lastScrollHeight &&
+            scrollableElement.scrollHeight === heightBefore &&
             consecutiveNoNewButtons > consecutiveNoNewButtonsMax
         ) {
-            chrome.runtime.sendMessage({
-                type: "LOG",
-                message: "End of list reached.",
-            });
-            break;
+            // Looks done. Recheck slowly before accepting it.
+            let grew = false;
+            for (let i = 0; i < SETTLE_CHECKS; i++) {
+                send({ type: "LOG", message: `Ověřuji konec seznamu (${i + 1}/${SETTLE_CHECKS})…` });
+                await sleep(SETTLE_WAIT_MS);
+                scrollableElement.scrollTop = scrollableElement.scrollHeight;
+                if (scrollableElement.scrollHeight !== heightBefore) {
+                    grew = true;
+                    break;
+                }
+            }
+            if (!grew) {
+                send({ type: "LOG", message: "Konec seznamu." });
+                break;
+            }
         }
     }
 
-    if (scrollableElement) {
-        scrollableElement.style.border = originalBorderStyle;
-    }
+    scrollableElement.style.border = originalBorderStyle;
     window.__inviter_running = false;
-    chrome.runtime.sendMessage({
-        type: "FINISHED",
-        count: count,
-        stopped: window.__inviter_stop,
-    });
+    send({ type: "FINISHED", count, stopped: window.__inviter_stop });
 }

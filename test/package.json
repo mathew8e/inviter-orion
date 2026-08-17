@@ -1,0 +1,13 @@
+{
+  "name": "inviter-orion-test-harness",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Local Puppeteer harness for rapidly testing the FB Auto Inviter extension without deploying to iOS.",
+  "type": "commonjs",
+  "scripts": {
+    "test": "node run.js"
+  },
+  "dependencies": {
+    "puppeteer": "^24"
+  }
+}
