@@ -229,6 +229,76 @@
             color: var(--ink-soft);
         }
 
+        /* --- Screen-awake switch: a run mode, so it sits with the controls --- */
+        .switch-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin-top: 12px;
+            padding: 11px 12px;
+            border-radius: 8px;
+            background: var(--chassis-hi);
+            cursor: pointer;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        .switch-label {
+            font-size: 13.5px;
+            color: var(--ink);
+        }
+
+        .switch-row input {
+            position: absolute;
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+
+        .switch {
+            position: relative;
+            flex: none;
+            width: 46px;
+            height: 28px;
+            border-radius: 14px;
+            background: var(--chassis-edge);
+            transition: background 0.15s ease;
+        }
+
+        .switch::before {
+            content: "";
+            position: absolute;
+            top: 3px;
+            left: 3px;
+            width: 22px;
+            height: 22px;
+            border-radius: 50%;
+            background: #fff;
+            box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+            transition: transform 0.15s ease;
+        }
+
+        .switch-row input:checked~.switch {
+            background: var(--go);
+        }
+
+        .switch-row input:checked~.switch::before {
+            transform: translateX(18px);
+        }
+
+        .switch-row input:focus-visible~.switch {
+            outline: 3px solid var(--ink);
+            outline-offset: 2px;
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+
+            .switch,
+            .switch::before {
+                transition: none;
+            }
+        }
+
         /* --- Folded-away settings: needed rarely, so not in the way --- */
         details {
             margin-top: 16px;
@@ -430,13 +500,19 @@
     <div class="display">
         <div class="count" id="count" aria-live="off">0000</div>
         <div class="count-label">Pozváno</div>
-        <p class="readout-line" id="status" role="status">Otevři seznam reakcí a spusť.</p>
+        <p class="readout-line" id="status" role="status">Otevři okno s reakcemi a spusť.</p>
     </div>
 
     <div class="controls">
         <button id="startBtn">Spustit</button>
         <button id="stopBtn" disabled>Zastavit</button>
     </div>
+
+    <label class="switch-row" for="keepAwake">
+        <span class="switch-label">Nenechat displej usnout</span>
+        <input type="checkbox" id="keepAwake" checked>
+        <span class="switch" aria-hidden="true"></span>
+    </label>
 
     <details>
         <summary>Nastavení</summary>
@@ -470,8 +546,8 @@
         </div>
 
         <div class="field">
-            <label for="noButton">Pokusů scrollování</label>
-            <input type="number" id="noButton" value="2000" min="1">
+            <label for="noButton">Prázdných scrollů do konce</label>
+            <input type="number" id="noButton" value="15" min="1">
         </div>
     </details>
 

@@ -2,16 +2,16 @@
 // truth, so a run that ends while the popup is closed is still recorded.
 
 const el = (id) => document.getElementById(id);
-
-// Callback form is supported everywhere; promise-returning chrome.storage is
-// not guaranteed on Orion, which is the browser this actually ships to.
-const storageGet = (keys) => new Promise((resolve) => chrome.storage.local.get(keys, resolve));
 const statusEl = el("status");
 const bandTextEl = el("bandText");
 const countEl = el("count");
 const startBtn = el("startBtn");
 const stopBtn = el("stopBtn");
 const historyBody = el("historyBody");
+
+// Callback form is supported everywhere; promise-returning chrome.storage is
+// not guaranteed on Orion, which is the browser this actually ships to.
+const storageGet = (keys) => new Promise((resolve) => chrome.storage.local.get(keys, resolve));
 
 const BAND_TEXT = {
     idle: "Připraveno",
@@ -23,6 +23,17 @@ const BAND_TEXT = {
 };
 
 const TAG_TEXT = { done: "Hotovo", stopped: "Stop", interrupted: "Chyba" };
+
+// Settings persist so the panel comes back the way it was left.
+const SETTINGS = {
+    string: "Pozvat",
+    delay: "0.5",
+    limit: "1000",
+    pauseAfter: "200",
+    scrollDelay: "500",
+    noButton: "15",
+    keepAwake: true,
+};
 
 // --- Rendering ---------------------------------------------------------
 
@@ -92,6 +103,32 @@ async function refresh() {
     renderHistory(data.invitationHistory);
 }
 
+// --- Settings ----------------------------------------------------------
+
+async function loadSettings() {
+    const saved = await storageGet("settings");
+    const s = { ...SETTINGS, ...(saved.settings || {}) };
+
+    Object.keys(SETTINGS).forEach((key) => {
+        const input = el(key);
+        if (!input) return;
+        if (input.type === "checkbox") input.checked = Boolean(s[key]);
+        else input.value = s[key];
+    });
+
+    el("delayValue").textContent = `${String(s.delay).replace(".", ",")} s`;
+}
+
+function saveSettings() {
+    const settings = {};
+    Object.keys(SETTINGS).forEach((key) => {
+        const input = el(key);
+        if (!input) return;
+        settings[key] = input.type === "checkbox" ? input.checked : input.value;
+    });
+    chrome.storage.local.set({ settings });
+}
+
 // --- Liveness check ----------------------------------------------------
 
 // A run marked active whose page no longer has the script alive (tab closed,
@@ -127,9 +164,13 @@ chrome.storage.onChanged.addListener((changes, namespace) => {
     if (changes.statusKind || changes.statusText || changes.count) refresh();
 });
 
-const delaySlider = el("delay");
-delaySlider.addEventListener("input", (e) => {
+el("delay").addEventListener("input", (e) => {
     el("delayValue").textContent = `${String(e.target.value).replace(".", ",")} s`;
+});
+
+Object.keys(SETTINGS).forEach((key) => {
+    const input = el(key);
+    if (input) input.addEventListener("change", saveSettings);
 });
 
 el("clearHistoryBtn").addEventListener("click", () => {
@@ -143,6 +184,7 @@ startBtn.addEventListener("click", async () => {
         return;
     }
 
+    saveSettings();
     chrome.runtime.sendMessage({ type: "START", tabId: tab.id });
 
     const num = (id, fallback) => {
@@ -167,8 +209,9 @@ startBtn.addEventListener("click", async () => {
                 num("delay", 0.5),
                 num("limit", 1000),
                 num("pauseAfter", 200),
-                num("noButton", 5),
+                num("noButton", 15),
                 num("scrollDelay", 500),
+                el("keepAwake").checked,
             ],
         });
     } catch (err) {
@@ -199,13 +242,22 @@ stopBtn.addEventListener("click", async () => {
 });
 
 document.addEventListener("DOMContentLoaded", async () => {
+    await loadSettings();
     await reconcileStaleRun();
     refresh();
 });
 
 // --- Injected into the Facebook page -----------------------------------
 
-async function autoInviteAction(inputString, delay, limit, pauseAfter, consecutiveNoNewButtonsMax, scrollDelay) {
+async function autoInviteAction(
+    inputString,
+    delay,
+    limit,
+    pauseAfter,
+    maxIdleScrolls,
+    scrollDelay,
+    keepAwake,
+) {
     const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
     // Messaging must never take the run down with it: the popup may be
@@ -219,107 +271,180 @@ async function autoInviteAction(inputString, delay, limit, pauseAfter, consecuti
     };
 
     // NOTES.md #2: the list is virtualised, so a quick "nothing new" check
-    // lies. Scroll fast, but once it looks finished, confirm slowly before
-    // believing it.
+    // lies. Scroll fast, but once it looks finished, confirm slowly.
     const SETTLE_WAIT_MS = 2000;
     const SETTLE_CHECKS = 2;
+    const KEYWORDS = ["invite", "pozvat", "sledovat", "follow"];
 
-    send({ type: "LOG", message: "Spouštím…" });
-
-    const selectors = [
-        'div[aria-label="Pozvat"][role="button"]',
-        'div[aria-label^="Pozvat"][role="button"]',
-        'div[aria-label="Sledovat"][role="button"]',
-        'div[aria-label="Follow"][role="button"]',
-        'div[role="button"]', // fallback
-    ];
-
-    send({ type: "LOG", message: "Klikni na tlačítko Pozvat, ať vím, kde je seznam." });
-
-    const anchorButton = await new Promise((resolve) => {
-        const clickListener = (event) => {
-            const targetElement = event.target.closest('div[role="button"], button');
-            if (!targetElement) return;
-
-            const label = targetElement.getAttribute("aria-label") || targetElement.textContent || "";
-            const keywords = ["invite", "pozvat", "sledovat", "follow"];
-
-            if (keywords.some((k) => label.toLowerCase().includes(k))) {
-                event.preventDefault();
-                event.stopPropagation();
-                event.stopImmediatePropagation();
-                document.removeEventListener("click", clickListener, true);
-                resolve(targetElement);
+    // --- Visual markers -------------------------------------------------
+    // Facebook restyles and re-renders its own buttons, and an invite button
+    // often vanishes once clicked — so the marker goes on the person's row,
+    // which survives, and uses !important to beat FB's inline styles.
+    const STYLE_ID = "__inviter_styles";
+    if (!document.getElementById(STYLE_ID)) {
+        const style = document.createElement("style");
+        style.id = STYLE_ID;
+        style.textContent = `
+            .__inviter-row { position: relative !important; border-radius: 8px !important; }
+            .__inviter-ok {
+                background: rgba(63,122,74,0.16) !important;
+                box-shadow: inset 0 0 0 2px #3F7A4A !important;
             }
-        };
-        document.addEventListener("click", clickListener, true);
-    });
-
-    send({ type: "LOG", message: "Mám seznam. Hledám scrollovatelnou oblast…" });
-
-    let scrollableElement = null;
-    let originalBorderStyle = "";
-
-    const dialog = anchorButton.closest('div[role="dialog"]');
-    if (dialog) {
-        let parent = anchorButton.parentElement;
-        while (parent && parent !== dialog) {
-            const style = window.getComputedStyle(parent);
-            if (style.overflowY === "scroll" || style.overflowY === "auto") {
-                scrollableElement = parent;
-                break;
+            .__inviter-fail {
+                background: rgba(163,47,40,0.16) !important;
+                box-shadow: inset 0 0 0 2px #A32F28 !important;
             }
-            parent = parent.parentElement;
-        }
-        if (!scrollableElement) scrollableElement = dialog;
-    } else {
-        scrollableElement = document.body;
+            .__inviter-ok::after, .__inviter-fail::after {
+                position: absolute !important;
+                top: 4px !important;
+                right: 6px !important;
+                z-index: 9999 !important;
+                padding: 1px 6px !important;
+                border-radius: 4px !important;
+                font: 700 10px/1.6 -apple-system, system-ui, sans-serif !important;
+                letter-spacing: .06em !important;
+                color: #fff !important;
+                pointer-events: none !important;
+            }
+            .__inviter-ok::after { content: "✓ POZVÁN" !important; background: #3F7A4A !important; }
+            .__inviter-fail::after { content: "× CHYBA" !important; background: #A32F28 !important; }
+            .__inviter-scroll { box-shadow: inset 0 0 0 3px #DC5314 !important; }
+        `;
+        document.documentElement.appendChild(style);
     }
 
-    originalBorderStyle = scrollableElement.style.border;
-    scrollableElement.style.border = "3px solid #DC5314";
+    // --- Keep the screen awake ------------------------------------------
+    // Requested here, not in the popup: the popup closes as soon as you tap
+    // away, and a wake lock dies with the document that holds it. This page
+    // stays open for the whole run.
+    let wakeLock = null;
+    const requestWakeLock = async () => {
+        if (!keepAwake || !("wakeLock" in navigator)) return;
+        try {
+            wakeLock = await navigator.wakeLock.request("screen");
+        } catch (e) {
+            send({ type: "LOG", message: `Displej nejde udržet vzhůru: ${e.message}` });
+        }
+    };
+    // iOS drops the lock whenever the page is backgrounded; take it back.
+    const onVisibility = () => {
+        if (document.visibilityState === "visible" && window.__inviter_running) requestWakeLock();
+    };
+    if (keepAwake) {
+        if (!("wakeLock" in navigator)) {
+            send({ type: "LOG", message: "Tento prohlížeč neumí držet displej vzhůru." });
+        } else {
+            await requestWakeLock();
+            document.addEventListener("visibilitychange", onVisibility);
+        }
+    }
+
+    // --- Find the list, without needing a click -------------------------
+    const visibleDialogs = Array.from(document.querySelectorAll('div[role="dialog"]')).filter(
+        (d) => d.getClientRects().length > 0,
+    );
+    // The topmost dialog is the one just opened.
+    const dialog = visibleDialogs[visibleDialogs.length - 1] || null;
+
+    const findScrollable = (root) => {
+        const candidates = Array.from(root.querySelectorAll("*")).filter((node) => {
+            const style = window.getComputedStyle(node);
+            const scrolls = style.overflowY === "auto" || style.overflowY === "scroll";
+            return scrolls && node.scrollHeight > node.clientHeight + 10;
+        });
+        // The reactor list is the tallest scrolling box in the dialog.
+        return candidates.sort((a, b) => b.clientHeight - a.clientHeight)[0] || null;
+    };
+
+    let scrollableElement = dialog ? findScrollable(dialog) : null;
+
+    if (!scrollableElement && dialog) {
+        scrollableElement = dialog;
+        send({ type: "LOG", message: "Seznam nemá vlastní scroll, používám celé okno." });
+    }
+
+    // Fall back to the old behaviour only if no dialog is open at all.
+    if (!scrollableElement) {
+        send({ type: "LOG", message: "Okno s reakcemi není otevřené. Klikni na tlačítko Pozvat." });
+
+        const anchorButton = await new Promise((resolve) => {
+            const clickListener = (event) => {
+                const target = event.target.closest('div[role="button"], button');
+                if (!target) return;
+                const label = target.getAttribute("aria-label") || target.textContent || "";
+                if (KEYWORDS.some((k) => label.toLowerCase().includes(k))) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    event.stopImmediatePropagation();
+                    document.removeEventListener("click", clickListener, true);
+                    resolve(target);
+                }
+            };
+            document.addEventListener("click", clickListener, true);
+        });
+
+        const anchorDialog = anchorButton.closest('div[role="dialog"]');
+        scrollableElement =
+            (anchorDialog && findScrollable(anchorDialog)) || anchorDialog || document.scrollingElement;
+    }
+
+    scrollableElement.classList.add("__inviter-scroll");
+    send({ type: "LOG", message: "Mám seznam. Scrolluji a zvu…" });
+
+    // --- Button matching ------------------------------------------------
+    // Match on aria-label OR visible text. Facebook frequently puts the word
+    // only in aria-label and leaves textContent empty or padded by nested
+    // spans, so an exact textContent match finds nothing at all.
+    const searchText = inputString.trim().toLowerCase();
+    const findInviteButtons = () =>
+        Array.from(scrollableElement.querySelectorAll('div[role="button"], button, a[role="button"]')).filter(
+            (btn) => {
+                if (btn.dataset.invited === "true") return false;
+                const label = (btn.getAttribute("aria-label") || "").trim().toLowerCase();
+                const text = (btn.textContent || "").trim().toLowerCase();
+                return label === searchText || text === searchText;
+            },
+        );
+
+    // Climb to the row: the direct child of the scroll container. That
+    // element survives the button being removed after a successful invite.
+    const rowOf = (btn) => {
+        let node = btn;
+        for (let i = 0; i < 10; i++) {
+            if (node.getAttribute("role") === "listitem") return node;
+            if (!node.parentElement || node.parentElement === scrollableElement) return node;
+            node = node.parentElement;
+        }
+        return node;
+    };
 
     if (typeof window.__inviter_stop === "undefined") window.__inviter_stop = false;
     window.__inviter_running = true;
 
     let count = 0;
-    const maxInvites = limit;
-    const pauseAfterInvites = pauseAfter;
-    const delaySeconds = delay;
-    const scrollWaitMs = scrollDelay;
-    let consecutiveNoNewButtons = 0;
+    let idleScrolls = 0;
 
-    while (!window.__inviter_stop && count < maxInvites) {
-        let currentVisibleButtons = [];
-        const searchText = inputString.trim().toLowerCase();
+    while (!window.__inviter_stop && count < limit) {
+        const buttons = findInviteButtons();
 
-        for (const selector of selectors) {
-            const found = Array.from(
-                document.querySelectorAll(`${selector}:not([data-invited="true"])`),
-            ).filter((btn) => (btn.textContent || "").trim().toLowerCase() === searchText);
-
-            if (found.length > 0) {
-                currentVisibleButtons = found;
-                send({ type: "LOG", message: `Nalezeno ${found.length} tlačítek.` });
-                break;
-            }
-        }
-
-        if (currentVisibleButtons.length === 0) {
-            consecutiveNoNewButtons++;
-            send({ type: "LOG", message: "Nic nového, scrolluji…" });
+        if (buttons.length === 0) {
+            idleScrolls++;
+            send({ type: "LOG", message: `Nic nového, scrolluji… (${idleScrolls})` });
         } else {
-            consecutiveNoNewButtons = 0;
+            idleScrolls = 0;
+            send({ type: "LOG", message: `Nalezeno ${buttons.length} tlačítek.` });
         }
 
-        for (const btn of currentVisibleButtons) {
-            if (window.__inviter_stop || count >= maxInvites) break;
+        for (const btn of buttons) {
+            if (window.__inviter_stop || count >= limit) break;
 
             btn.dataset.invited = "true";
+            const row = rowOf(btn);
+            row.classList.add("__inviter-row");
 
             // Invite pacing stays conservative — this is the rate-limit
             // surface (NOTES.md #3), not the scrolling.
-            await sleep(Math.random() * delaySeconds * 1000 + 500);
+            await sleep(Math.random() * delay * 1000 + 500);
 
             btn.scrollIntoView({ block: "center" });
             await sleep(80);
@@ -328,14 +453,14 @@ async function autoInviteAction(inputString, delay, limit, pauseAfter, consecuti
 
             try {
                 btn.click();
-                btn.style.backgroundColor = "#3F7A4A";
+                row.classList.add("__inviter-ok");
                 count++;
                 send({ type: "UPDATE_COUNT", count });
             } catch {
-                btn.style.backgroundColor = "#A32F28";
+                row.classList.add("__inviter-fail");
             }
 
-            if (count > 0 && count % pauseAfterInvites === 0) {
+            if (count > 0 && count % pauseAfter === 0) {
                 send({ type: "LOG", message: `Pauza 30 s po ${count} pozvánkách.` });
                 await sleep(30000);
             }
@@ -343,12 +468,9 @@ async function autoInviteAction(inputString, delay, limit, pauseAfter, consecuti
 
         const heightBefore = scrollableElement.scrollHeight;
         scrollableElement.scrollTop = scrollableElement.scrollHeight;
-        await sleep(scrollWaitMs);
+        await sleep(scrollDelay);
 
-        if (
-            scrollableElement.scrollHeight === heightBefore &&
-            consecutiveNoNewButtons > consecutiveNoNewButtonsMax
-        ) {
+        if (scrollableElement.scrollHeight === heightBefore && idleScrolls > maxIdleScrolls) {
             // Looks done. Recheck slowly before accepting it.
             let grew = false;
             for (let i = 0; i < SETTLE_CHECKS; i++) {
@@ -367,7 +489,16 @@ async function autoInviteAction(inputString, delay, limit, pauseAfter, consecuti
         }
     }
 
-    scrollableElement.style.border = originalBorderStyle;
+    scrollableElement.classList.remove("__inviter-scroll");
+    document.removeEventListener("visibilitychange", onVisibility);
+    if (wakeLock) {
+        try {
+            await wakeLock.release();
+        } catch {
+            /* already gone */
+        }
+    }
+
     window.__inviter_running = false;
     send({ type: "FINISHED", count, stopped: window.__inviter_stop });
 }
