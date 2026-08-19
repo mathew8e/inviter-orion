@@ -481,21 +481,33 @@ async function autoInviteAction(
             const target = markTarget(btn);
             target.classList.add("__inviter-row");
 
+            // Belt and braces: set the colour directly on the button too,
+            // the same way the very first version of this script did
+            // (btn.style.backgroundColor, no !important, no stylesheet).
+            // That was crude but always visible. The classList/::after
+            // badge above is the nicer version; this is the fallback that
+            // cannot fail to apply just because an injected <style> tag
+            // didn't take effect for some engine-specific reason.
+            const paint = (color) => btn.style.setProperty("background-color", color, "important");
+
             // Visible "about to click" beat before the tap actually lands,
             // so someone watching the screen can see it deliberately
             // targeting each person rather than skipping silently.
             target.classList.add("__inviter-target");
+            paint("#DC5314");
             await sleep(450);
 
             try {
                 btn.click();
                 target.classList.remove("__inviter-target");
                 target.classList.add("__inviter-ok");
+                paint("#3F7A4A");
                 count++;
                 send({ type: "UPDATE_COUNT", count });
             } catch {
                 target.classList.remove("__inviter-target");
                 target.classList.add("__inviter-fail");
+                paint("#A32F28");
             }
 
             if (count > 0 && count % pauseAfter === 0) {
