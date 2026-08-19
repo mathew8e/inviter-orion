@@ -433,16 +433,16 @@ async function autoInviteAction(
             },
         );
 
-    // Climb to the row: the direct child of the scroll container. That
-    // element survives the button being removed after a successful invite.
-    const rowOf = (btn) => {
-        let node = btn;
-        for (let i = 0; i < 10; i++) {
-            if (node.getAttribute("role") === "listitem") return node;
-            if (!node.parentElement || node.parentElement === scrollableElement) return node;
-            node = node.parentElement;
-        }
-        return node;
+    // Mark the button itself, not a guessed ancestor "row" — climbing the
+    // tree to find a container that survives the click turned out to reach
+    // much too far up on some DOM shapes (as far as the whole dialog). Only
+    // fall back one level if the button itself has no visible box (a pure
+    // event-delegation wrapper with zero size, so nothing would be visible
+    // to mark).
+    const markTarget = (btn) => {
+        const rect = btn.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) return btn;
+        return btn.parentElement || btn;
     };
 
     if (typeof window.__inviter_stop === "undefined") window.__inviter_stop = false;
@@ -466,8 +466,6 @@ async function autoInviteAction(
             if (window.__inviter_stop || count >= limit) break;
 
             btn.dataset.invited = "true";
-            const row = rowOf(btn);
-            row.classList.add("__inviter-row");
 
             // Invite pacing stays conservative — this is the rate-limit
             // surface (NOTES.md #3), not the scrolling.
@@ -478,21 +476,26 @@ async function autoInviteAction(
 
             if (!document.body.contains(btn)) continue;
 
+            // Computed after scrolling, so the box we measure reflects
+            // where the button actually ended up.
+            const target = markTarget(btn);
+            target.classList.add("__inviter-row");
+
             // Visible "about to click" beat before the tap actually lands,
             // so someone watching the screen can see it deliberately
             // targeting each person rather than skipping silently.
-            row.classList.add("__inviter-target");
+            target.classList.add("__inviter-target");
             await sleep(450);
 
             try {
                 btn.click();
-                row.classList.remove("__inviter-target");
-                row.classList.add("__inviter-ok");
+                target.classList.remove("__inviter-target");
+                target.classList.add("__inviter-ok");
                 count++;
                 send({ type: "UPDATE_COUNT", count });
             } catch {
-                row.classList.remove("__inviter-target");
-                row.classList.add("__inviter-fail");
+                target.classList.remove("__inviter-target");
+                target.classList.add("__inviter-fail");
             }
 
             if (count > 0 && count % pauseAfter === 0) {
