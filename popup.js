@@ -285,16 +285,27 @@ async function autoInviteAction(
         const style = document.createElement("style");
         style.id = STYLE_ID;
         style.textContent = `
-            .__inviter-row { position: relative !important; border-radius: 8px !important; }
+            .__inviter-row {
+                position: relative !important;
+                border-radius: 8px !important;
+                transition: background 0.25s ease, box-shadow 0.25s ease !important;
+            }
+            .__inviter-target {
+                background: rgba(220,83,20,0.14) !important;
+                box-shadow: inset 0 0 0 2px #DC5314 !important;
+                animation: __inviter-pulse 0.55s ease-in-out infinite !important;
+            }
             .__inviter-ok {
                 background: rgba(63,122,74,0.16) !important;
                 box-shadow: inset 0 0 0 2px #3F7A4A !important;
+                animation: __inviter-pop 0.3s ease-out !important;
             }
             .__inviter-fail {
                 background: rgba(163,47,40,0.16) !important;
                 box-shadow: inset 0 0 0 2px #A32F28 !important;
+                animation: __inviter-pop 0.3s ease-out !important;
             }
-            .__inviter-ok::after, .__inviter-fail::after {
+            .__inviter-target::after, .__inviter-ok::after, .__inviter-fail::after {
                 position: absolute !important;
                 top: 4px !important;
                 right: 6px !important;
@@ -306,9 +317,23 @@ async function autoInviteAction(
                 color: #fff !important;
                 pointer-events: none !important;
             }
+            .__inviter-target::after { content: "→ ZVU…" !important; background: #DC5314 !important; }
             .__inviter-ok::after { content: "✓ POZVÁN" !important; background: #3F7A4A !important; }
             .__inviter-fail::after { content: "× CHYBA" !important; background: #A32F28 !important; }
             .__inviter-scroll { box-shadow: inset 0 0 0 3px #DC5314 !important; }
+            @keyframes __inviter-pulse {
+                0%, 100% { box-shadow: inset 0 0 0 2px #DC5314 !important; }
+                50% { box-shadow: inset 0 0 0 4px #ff8347 !important; }
+            }
+            @keyframes __inviter-pop {
+                0% { transform: scale(0.97); }
+                55% { transform: scale(1.015); }
+                100% { transform: scale(1); }
+            }
+            @media (prefers-reduced-motion: reduce) {
+                .__inviter-target { animation: none !important; }
+                .__inviter-ok, .__inviter-fail { animation: none !important; }
+            }
         `;
         document.documentElement.appendChild(style);
     }
@@ -451,12 +476,20 @@ async function autoInviteAction(
 
             if (!document.body.contains(btn)) continue;
 
+            // Visible "about to click" beat before the tap actually lands,
+            // so someone watching the screen can see it deliberately
+            // targeting each person rather than skipping silently.
+            row.classList.add("__inviter-target");
+            await sleep(450);
+
             try {
                 btn.click();
+                row.classList.remove("__inviter-target");
                 row.classList.add("__inviter-ok");
                 count++;
                 send({ type: "UPDATE_COUNT", count });
             } catch {
+                row.classList.remove("__inviter-target");
                 row.classList.add("__inviter-fail");
             }
 
