@@ -58,22 +58,18 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             setState({ statusText: request.message });
             break;
 
-        case "FINISHED": {
-            const suffix = request.unverifiedTaps
-                ? ` (${request.unverifiedTaps} bez potvrzení — otevři DBG)`
-                : "";
+        case "FINISHED":
             setState({
                 isRunning: false,
                 count: request.count,
                 statusText: request.stopped
-                    ? `Zastaveno. Pozváno ${request.count}.${suffix}`
-                    : `Hotovo. Pozváno ${request.count}.${suffix}`,
+                    ? `Zastaveno. Pozváno ${request.count}.`
+                    : `Hotovo. Pozváno ${request.count}.`,
                 statusKind: request.stopped ? "stopped" : "done",
                 runTabId: null,
             });
             appendHistory(request.count, request.stopped ? "stopped" : "done");
             break;
-        }
 
         // The popup found a run marked active whose page is no longer
         // running the script (tab closed, reloaded, or navigated away).
