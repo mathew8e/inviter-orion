@@ -273,9 +273,9 @@ async function autoInviteAction(
     // NOTES.md #2: the list is virtualised, so a quick "nothing new" check
     // lies. Scroll fast, but once it looks finished, confirm slowly — with
     // growing waits, since on a slow connection the next batch of people
-    // can take much longer than a couple of seconds to arrive over the
-    // network. Cumulative: 3+6+12+24+45 = 90s before giving up for good.
-    const SETTLE_WAITS_MS = [3000, 6000, 12000, 24000, 45000];
+    // can take a bit longer than a couple of seconds to arrive over the
+    // network. Cumulative: 5+10+15 = 30s before giving up for good.
+    const SETTLE_WAITS_MS = [5000, 10000, 15000];
     const KEYWORDS = ["invite", "pozvat", "sledovat", "follow"];
 
     // --- Visual markers -------------------------------------------------
@@ -418,6 +418,92 @@ async function autoInviteAction(
     scrollableElement.classList.add("__inviter-scroll");
     send({ type: "LOG", message: "Mám seznam. Scrolluji a zvu…" });
 
+    // --- On-page status HUD -----------------------------------------------
+    // Lives in the Facebook page itself, not the popup — so it keeps
+    // showing progress and stays stoppable even after the popup is closed,
+    // which on a phone is most of the run. A fixed pill under the dialog
+    // rather than anchored to the dialog's own box, since the dialog can
+    // resize/reflow mid-run and a fixed position survives that.
+    const HUD_ID = "__inviter_hud";
+    document.getElementById(HUD_ID)?.remove();
+
+    const hud = document.createElement("div");
+    hud.id = HUD_ID;
+    hud.style.cssText = `
+        position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%);
+        z-index: 2147483647; display: flex; align-items: center; gap: 10px;
+        padding: 9px 10px 9px 16px; border-radius: 999px;
+        background: #1E211F; color: #DCE7D8;
+        font: 600 13px/1 ui-monospace, "SF Mono", Menlo, monospace;
+        box-shadow: 0 6px 20px rgba(0,0,0,.45); user-select: none;
+        transition: background 0.2s ease; white-space: nowrap; max-width: calc(100vw - 24px);
+    `;
+    hud.innerHTML = `
+        <span id="__inviter_hud_time">00:00</span>
+        <span style="opacity:.35">•</span>
+        <span id="__inviter_hud_count">0 pozváno</span>
+        <button id="__inviter_hud_action" style="
+            margin-left: 4px; padding: 6px 14px; border: none; border-radius: 999px;
+            background: #A32F28; color: #fff; font: 700 11px ui-monospace, monospace;
+            letter-spacing: .05em; text-transform: uppercase; cursor: pointer;
+        ">Stop</button>
+    `;
+    document.body.appendChild(hud);
+
+    const hudTimeEl = hud.querySelector("#__inviter_hud_time");
+    const hudCountEl = hud.querySelector("#__inviter_hud_count");
+    const hudActionBtn = hud.querySelector("#__inviter_hud_action");
+
+    const hudStart = Date.now();
+    const hudTick = () => {
+        const s = Math.floor((Date.now() - hudStart) / 1000);
+        hudTimeEl.textContent = `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+    };
+    hudTick();
+    const hudInterval = setInterval(hudTick, 1000);
+
+    hudActionBtn.addEventListener("click", () => {
+        if (hudActionBtn.dataset.mode === "dismiss") {
+            hud.remove();
+            return;
+        }
+        window.__inviter_stop = true;
+        hudActionBtn.textContent = "…";
+        hudActionBtn.disabled = true;
+        // Keep the popup's own state in sync in case it's open, or gets
+        // opened before the run actually finishes.
+        send({ type: "STOP_REQUEST" });
+    });
+
+    const hudUpdateCount = (n) => {
+        hudCountEl.textContent = `${n} pozváno`;
+    };
+
+    const hudFinish = (finalCount, stopped) => {
+        clearInterval(hudInterval);
+        hud.style.background = stopped ? "#A32F28" : "#3F7A4A";
+        hudCountEl.textContent = `${finalCount} pozváno`;
+        hudActionBtn.textContent = "OK";
+        hudActionBtn.disabled = false;
+        hudActionBtn.dataset.mode = "dismiss";
+        hudActionBtn.style.background = "rgba(255,255,255,.18)";
+
+        // Flash a few times so it's noticeable even if you're not looking
+        // right at it when the run ends.
+        let flashes = 0;
+        const baseColor = hud.style.background;
+        const flashInterval = setInterval(() => {
+            hud.style.background = flashes % 2 === 0 ? "#DCE7D8" : baseColor;
+            hud.style.color = flashes % 2 === 0 ? "#1E211F" : "#DCE7D8";
+            flashes++;
+            if (flashes >= 6) {
+                clearInterval(flashInterval);
+                hud.style.background = baseColor;
+                hud.style.color = "#DCE7D8";
+            }
+        }, 220);
+    };
+
     // --- Button matching ------------------------------------------------
     // Match on aria-label OR visible text. Facebook frequently puts the word
     // only in aria-label and leaves textContent empty or padded by nested
@@ -504,6 +590,7 @@ async function autoInviteAction(
                 paint("#3F7A4A");
                 count++;
                 send({ type: "UPDATE_COUNT", count });
+                hudUpdateCount(count);
             } catch {
                 target.classList.remove("__inviter-target");
                 target.classList.add("__inviter-fail");
@@ -559,5 +646,6 @@ async function autoInviteAction(
     }
 
     window.__inviter_running = false;
+    hudFinish(count, Boolean(window.__inviter_stop));
     send({ type: "FINISHED", count, stopped: window.__inviter_stop });
 }
