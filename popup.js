@@ -271,9 +271,11 @@ async function autoInviteAction(
     };
 
     // NOTES.md #2: the list is virtualised, so a quick "nothing new" check
-    // lies. Scroll fast, but once it looks finished, confirm slowly.
-    const SETTLE_WAIT_MS = 2000;
-    const SETTLE_CHECKS = 2;
+    // lies. Scroll fast, but once it looks finished, confirm slowly — with
+    // growing waits, since on a slow connection the next batch of people
+    // can take much longer than a couple of seconds to arrive over the
+    // network. Cumulative: 3+6+12+24+45 = 90s before giving up for good.
+    const SETTLE_WAITS_MS = [3000, 6000, 12000, 24000, 45000];
     const KEYWORDS = ["invite", "pozvat", "sledovat", "follow"];
 
     // --- Visual markers -------------------------------------------------
@@ -504,18 +506,27 @@ async function autoInviteAction(
         await sleep(scrollDelay);
 
         if (scrollableElement.scrollHeight === heightBefore && idleScrolls > maxIdleScrolls) {
-            // Looks done. Recheck slowly before accepting it.
+            // Looks done. Recheck with growing waits before accepting it —
+            // a fast connection confirms in a few seconds, a slow one gets
+            // up to 90s total before the list is declared finished.
             let grew = false;
-            for (let i = 0; i < SETTLE_CHECKS; i++) {
-                send({ type: "LOG", message: `Ověřuji konec seznamu (${i + 1}/${SETTLE_CHECKS})…` });
-                await sleep(SETTLE_WAIT_MS);
+            for (let i = 0; i < SETTLE_WAITS_MS.length; i++) {
+                if (window.__inviter_stop) break;
+                const waitMs = SETTLE_WAITS_MS[i];
+                send({
+                    type: "LOG",
+                    message: `Ověřuji konec seznamu (${i + 1}/${SETTLE_WAITS_MS.length}, čekám ${waitMs / 1000}s)…`,
+                });
+                await sleep(waitMs);
                 scrollableElement.scrollTop = scrollableElement.scrollHeight;
+                await sleep(300); // give a slow load a moment to paint before measuring
                 if (scrollableElement.scrollHeight !== heightBefore) {
                     grew = true;
+                    idleScrolls = 0;
                     break;
                 }
             }
-            if (!grew) {
+            if (!grew && !window.__inviter_stop) {
                 send({ type: "LOG", message: "Konec seznamu." });
                 break;
             }
