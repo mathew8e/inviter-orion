@@ -16,6 +16,10 @@ const IDLE_STATE = {
 
 const HISTORY_LIMIT = 20;
 
+// How long to wait for the page to confirm a stop before settling anyway.
+const STOP_TIMEOUT_MS = 8000;
+let stopWatchdog = null;
+
 function setState(patch) {
     return chrome.storage.local.set(patch);
 }
@@ -44,11 +48,30 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             });
             break;
 
-        case "STOP_REQUEST":
+        case "STOP_REQUEST": {
             // The injected script decides when it actually stops; it reports
             // back with FINISHED. Until then this is only "stopping".
             setState({ statusText: "Zastavuji…", statusKind: "stopping" });
+
+            // ...but never wait forever. If the page can't report back (its
+            // messages may not reach us at all on some builds), settle the
+            // state anyway so the panel can't sit on "Zastavuji…" until the
+            // whole browser is force-quit.
+            clearTimeout(stopWatchdog);
+            stopWatchdog = setTimeout(() => {
+                chrome.storage.local.get(["statusKind", "count"], (data) => {
+                    if (data.statusKind !== "stopping") return;
+                    setState({
+                        isRunning: false,
+                        statusText: `Zastaveno. Pozváno ${data.count || 0}.`,
+                        statusKind: "stopped",
+                        runTabId: null,
+                    });
+                    appendHistory(data.count || 0, "stopped");
+                });
+            }, STOP_TIMEOUT_MS);
             break;
+        }
 
         case "UPDATE_COUNT":
             setState({ count: request.count });
@@ -59,16 +82,22 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             break;
 
         case "FINISHED":
-            setState({
-                isRunning: false,
-                count: request.count,
-                statusText: request.stopped
-                    ? `Zastaveno. Pozváno ${request.count}.`
-                    : `Hotovo. Pozváno ${request.count}.`,
-                statusKind: request.stopped ? "stopped" : "done",
-                runTabId: null,
+            clearTimeout(stopWatchdog);
+            // Idempotent: the popup's poll can report the same finish more
+            // than once, and each one must not add its own history row.
+            chrome.storage.local.get("isRunning", (data) => {
+                if (!data.isRunning) return;
+                setState({
+                    isRunning: false,
+                    count: request.count,
+                    statusText: request.stopped
+                        ? `Zastaveno. Pozváno ${request.count}.`
+                        : `Hotovo. Pozváno ${request.count}.`,
+                    statusKind: request.stopped ? "stopped" : "done",
+                    runTabId: null,
+                });
+                appendHistory(request.count, request.stopped ? "stopped" : "done");
             });
-            appendHistory(request.count, request.stopped ? "stopped" : "done");
             break;
 
         // The popup found a run marked active whose page is no longer

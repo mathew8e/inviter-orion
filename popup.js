@@ -156,6 +156,57 @@ async function reconcileStaleRun() {
     }
 }
 
+// --- Polling the page directly -----------------------------------------
+
+// Belt and braces for devices where chrome.runtime.sendMessage from the
+// injected script never arrives (seen on iOS Orion): read the state the
+// script mirrors into the page's DOM and feed it into the normal flow.
+// Uses executeScript, which is known to work — the run starts at all.
+async function pollRunState() {
+    const { isRunning, runTabId } = await storageGet(["isRunning", "runTabId"]);
+    if (!isRunning || runTabId == null) return;
+
+    let snap;
+    try {
+        const [{ result }] = await chrome.scripting.executeScript({
+            target: { tabId: runTabId },
+            func: () => {
+                const r = document.documentElement;
+                const s = {
+                    running: r.getAttribute("data-inviter-running"),
+                    count: parseInt(r.getAttribute("data-inviter-count"), 10) || 0,
+                    status: r.getAttribute("data-inviter-status"),
+                    done: r.getAttribute("data-inviter-done") === "1",
+                    stopped: r.getAttribute("data-inviter-stopped") === "1",
+                    alive: window.__inviter_running === true,
+                };
+                // Consume the finished flag so it's only reported once and
+                // history doesn't get an entry per poll.
+                if (s.done) r.setAttribute("data-inviter-done", "0");
+                return s;
+            },
+        });
+        snap = result;
+    } catch {
+        return; // tab gone; reconcileStaleRun settles it on next open
+    }
+    if (!snap) return;
+
+    if (snap.done) {
+        chrome.runtime.sendMessage({ type: "FINISHED", count: snap.count, stopped: snap.stopped });
+        return;
+    }
+
+    if (snap.status) chrome.runtime.sendMessage({ type: "LOG", message: snap.status });
+    chrome.runtime.sendMessage({ type: "UPDATE_COUNT", count: snap.count });
+
+    // The script is gone but never reported finishing — settle it rather
+    // than leaving the panel stuck on "Zastavuji…" forever.
+    if (!snap.alive) {
+        chrome.runtime.sendMessage({ type: "FINISHED", count: snap.count, stopped: true });
+    }
+}
+
 // --- Events ------------------------------------------------------------
 
 chrome.storage.onChanged.addListener((changes, namespace) => {
@@ -198,6 +249,12 @@ startBtn.addEventListener("click", async () => {
             func: () => {
                 window.__inviter_stop = false;
                 window.__inviter_running = true;
+                const r = document.documentElement;
+                r.setAttribute("data-inviter-stop", "0");
+                r.setAttribute("data-inviter-done", "0");
+                r.setAttribute("data-inviter-running", "1");
+                r.setAttribute("data-inviter-count", "0");
+                r.setAttribute("data-inviter-status", "Spouštím…");
             },
         });
 
@@ -233,6 +290,8 @@ stopBtn.addEventListener("click", async () => {
             target: { tabId },
             func: () => {
                 window.__inviter_stop = true;
+                // The attribute is the one that reliably crosses contexts.
+                document.documentElement.setAttribute("data-inviter-stop", "1");
             },
         });
     } catch {
@@ -241,11 +300,23 @@ stopBtn.addEventListener("click", async () => {
     }
 });
 
-document.addEventListener("DOMContentLoaded", async () => {
+async function init() {
     await loadSettings();
     await reconcileStaleRun();
     refresh();
-});
+    // Keep reading straight from the page while the panel is open, so the
+    // count and the finish still land even if messaging is dead.
+    pollRunState();
+    setInterval(pollRunState, 1000);
+}
+
+// The script tag is at the end of <body>, so DOMContentLoaded may already
+// have fired by the time this runs — in which case the listener never would.
+if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+} else {
+    init();
+}
 
 // --- Injected into the Facebook page -----------------------------------
 
@@ -262,7 +333,30 @@ async function autoInviteAction(
 
     // Messaging must never take the run down with it: the popup may be
     // closed and the service worker asleep.
+    const root = document.documentElement;
+
+    // Mirror every status update into the DOM as well as messaging it.
+    // On some builds (seen on iOS Orion) chrome.runtime.sendMessage from an
+    // injected script never reaches the extension at all — which froze the
+    // panel on its last popup-set status, left the counter on zero, and
+    // made Stop hang forever waiting for a FINISHED that could not arrive.
+    // The DOM is shared across JS contexts and readable via
+    // chrome.scripting.executeScript (which demonstrably does work, since
+    // the script runs at all), so the popup can poll this instead.
+    const publish = (patch) => {
+        try {
+            Object.keys(patch).forEach((k) => root.setAttribute(`data-inviter-${k}`, String(patch[k])));
+        } catch (e) {
+            console.warn("inviter: publish failed", e);
+        }
+    };
+
     const send = (msg) => {
+        if (msg.type === "LOG") publish({ status: msg.message });
+        if (msg.type === "UPDATE_COUNT") publish({ count: msg.count });
+        if (msg.type === "FINISHED") {
+            publish({ count: msg.count, running: 0, done: 1, stopped: msg.stopped ? 1 : 0 });
+        }
         try {
             chrome.runtime.sendMessage(msg, () => void chrome.runtime.lastError);
         } catch (e) {
@@ -270,6 +364,33 @@ async function autoInviteAction(
         }
     };
 
+    // Stop may be set from a *separate* executeScript call, which is not
+    // guaranteed to share `window` with this one. The DOM attribute always
+    // crosses that boundary; the window flag is kept for compatibility.
+    const isStopped = () => root.getAttribute("data-inviter-stop") === "1" || window.__inviter_stop === true;
+
+    // Declared here, not inside run(), so a crash before the loop even
+    // starts can still report an accurate (zero) count.
+    let count = 0;
+
+    // Anything in run() can throw — a permissions-policy quirk, a WebKit
+    // API difference, anything engine-specific we haven't seen on this
+    // exact build of Orion. Without this wrapper, a throw before the first
+    // send() left the panel frozen on "Spouštím…" forever with no error
+    // anywhere, because chrome.scripting.executeScript's own promise still
+    // resolves normally even when the injected function throws internally.
+    try {
+        await run();
+    } catch (e) {
+        const message = e && e.message ? e.message : String(e);
+        console.error("inviter: run() failed:", e);
+        send({ type: "LOG", message: `Chyba: ${message}` });
+        send({ type: "FINISHED", count, stopped: true });
+        window.__inviter_running = false;
+    }
+    return;
+
+    async function run() {
     // NOTES.md #2: the list is virtualised, so a quick "nothing new" check
     // lies. Scroll fast, but once it looks finished, confirm slowly — with
     // growing waits, since on a slow connection the next batch of people
@@ -395,6 +516,10 @@ async function autoInviteAction(
         send({ type: "LOG", message: "Okno s reakcemi není otevřené. Klikni na tlačítko Pozvat." });
 
         const anchorButton = await new Promise((resolve) => {
+            const cleanup = () => {
+                document.removeEventListener("click", clickListener, true);
+                clearInterval(stopGuard);
+            };
             const clickListener = (event) => {
                 const target = event.target.closest('div[role="button"], button');
                 if (!target) return;
@@ -403,12 +528,28 @@ async function autoInviteAction(
                     event.preventDefault();
                     event.stopPropagation();
                     event.stopImmediatePropagation();
-                    document.removeEventListener("click", clickListener, true);
+                    cleanup();
                     resolve(target);
                 }
             };
+            // Without this the script parks here forever waiting for a click
+            // that may never come, never reaching the loop that checks the
+            // stop flag — so Stop did nothing and the only way out was
+            // force-quitting the whole browser.
+            const stopGuard = setInterval(() => {
+                if (isStopped()) {
+                    cleanup();
+                    resolve(null);
+                }
+            }, 400);
             document.addEventListener("click", clickListener, true);
         });
+
+        if (!anchorButton) {
+            send({ type: "FINISHED", count, stopped: true });
+            window.__inviter_running = false;
+            return;
+        }
 
         const anchorDialog = anchorButton.closest('div[role="dialog"]');
         scrollableElement =
@@ -468,6 +609,7 @@ async function autoInviteAction(
             return;
         }
         window.__inviter_stop = true;
+        publish({ stop: 1 });
         hudActionBtn.textContent = "…";
         hudActionBtn.disabled = true;
         // Keep the popup's own state in sync in case it's open, or gets
@@ -534,10 +676,11 @@ async function autoInviteAction(
     if (typeof window.__inviter_stop === "undefined") window.__inviter_stop = false;
     window.__inviter_running = true;
 
-    let count = 0;
+    // count is declared in the outer scope, not here, so a failure in
+    // run() before this point can still report an accurate count.
     let idleScrolls = 0;
 
-    while (!window.__inviter_stop && count < limit) {
+    while (!isStopped() && count < limit) {
         const buttons = findInviteButtons();
 
         if (buttons.length === 0) {
@@ -549,7 +692,7 @@ async function autoInviteAction(
         }
 
         for (const btn of buttons) {
-            if (window.__inviter_stop || count >= limit) break;
+            if (isStopped() || count >= limit) break;
 
             btn.dataset.invited = "true";
 
@@ -613,7 +756,7 @@ async function autoInviteAction(
             // up to 90s total before the list is declared finished.
             let grew = false;
             for (let i = 0; i < SETTLE_WAITS_MS.length; i++) {
-                if (window.__inviter_stop) break;
+                if (isStopped()) break;
                 const waitMs = SETTLE_WAITS_MS[i];
                 send({
                     type: "LOG",
@@ -628,7 +771,7 @@ async function autoInviteAction(
                     break;
                 }
             }
-            if (!grew && !window.__inviter_stop) {
+            if (!grew && !isStopped()) {
                 send({ type: "LOG", message: "Konec seznamu." });
                 break;
             }
@@ -646,6 +789,7 @@ async function autoInviteAction(
     }
 
     window.__inviter_running = false;
-    hudFinish(count, Boolean(window.__inviter_stop));
-    send({ type: "FINISHED", count, stopped: window.__inviter_stop });
+    hudFinish(count, isStopped());
+    send({ type: "FINISHED", count, stopped: isStopped() });
+    } // end run()
 }
