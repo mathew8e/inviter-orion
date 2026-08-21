@@ -129,81 +129,66 @@ function saveSettings() {
     chrome.storage.local.set({ settings });
 }
 
-// --- Liveness check ----------------------------------------------------
+// --- Reading the run's state straight from the page --------------------
 
-// A run marked active whose page no longer has the script alive (tab closed,
-// reloaded, or navigated away) never gets to send FINISHED. Catch that on
-// open so the panel can't sit on a stale "running".
-async function reconcileStaleRun() {
-    const { isRunning, runTabId, count } = await storageGet(["isRunning", "runTabId", "count"]);
-    if (!isRunning) return;
-
-    let alive = false;
-    if (runTabId != null) {
-        try {
-            const [{ result }] = await chrome.scripting.executeScript({
-                target: { tabId: runTabId },
-                func: () => window.__inviter_running === true,
-            });
-            alive = result === true;
-        } catch {
-            alive = false; // tab is gone or not scriptable
-        }
-    }
-
-    if (!alive) {
-        chrome.runtime.sendMessage({ type: "RECONCILE_DEAD_RUN", count: count || 0 });
-    }
-}
-
-// --- Polling the page directly -----------------------------------------
-
-// Belt and braces for devices where chrome.runtime.sendMessage from the
-// injected script never arrives (seen on iOS Orion): read the state the
-// script mirrors into the page's DOM and feed it into the normal flow.
-// Uses executeScript, which is known to work — the run starts at all.
-async function pollRunState() {
-    const { isRunning, runTabId } = await storageGet(["isRunning", "runTabId"]);
-    if (!isRunning || runTabId == null) return;
-
-    let snap;
+// Read the state the injected script mirrors into the page's DOM. This is
+// the only channel that works on builds where the script's own
+// chrome.runtime.sendMessage never reaches the extension (iOS Orion).
+async function readPageState(tabId) {
     try {
         const [{ result }] = await chrome.scripting.executeScript({
-            target: { tabId: runTabId },
+            target: { tabId },
             func: () => {
                 const r = document.documentElement;
                 const s = {
-                    running: r.getAttribute("data-inviter-running"),
                     count: parseInt(r.getAttribute("data-inviter-count"), 10) || 0,
                     status: r.getAttribute("data-inviter-status"),
                     done: r.getAttribute("data-inviter-done") === "1",
                     stopped: r.getAttribute("data-inviter-stopped") === "1",
                     alive: window.__inviter_running === true,
                 };
-                // Consume the finished flag so it's only reported once and
-                // history doesn't get an entry per poll.
+                // Consume the finished flag so a finish is reported once and
+                // repeated polls can't add a history row each time.
                 if (s.done) r.setAttribute("data-inviter-done", "0");
                 return s;
             },
         });
-        snap = result;
+        return result || null;
     } catch {
-        return; // tab gone; reconcileStaleRun settles it on next open
+        return null; // tab is gone or not scriptable
     }
-    if (!snap) return;
+}
 
-    if (snap.done) {
-        chrome.runtime.sendMessage({ type: "FINISHED", count: snap.count, stopped: snap.stopped });
+// --- Polling the page directly -----------------------------------------
+
+// Runs on open and then on a timer. Also recovers a run that finished
+// while the panel was closed, which on a phone is most of the time — the
+// DOM attributes survive on the page, so the real count is still there to
+// be read and written into the history.
+async function syncFromPage() {
+    const { isRunning, runTabId, count } = await storageGet(["isRunning", "runTabId", "count"]);
+    if (!isRunning) return;
+
+    const snap = runTabId == null ? null : await readPageState(runTabId);
+
+    // Tab is gone entirely, so there is nothing left to recover from.
+    if (!snap) {
+        chrome.runtime.sendMessage({ type: "RECONCILE_DEAD_RUN", count: count || 0 });
         return;
     }
 
     if (snap.status) chrome.runtime.sendMessage({ type: "LOG", message: snap.status });
     chrome.runtime.sendMessage({ type: "UPDATE_COUNT", count: snap.count });
 
-    // The script is gone but never reported finishing — settle it rather
-    // than leaving the panel stuck on "Zastavuji…" forever.
-    if (!snap.alive) {
-        chrome.runtime.sendMessage({ type: "FINISHED", count: snap.count, stopped: true });
+    // Either it reported finishing, or the script is no longer alive and
+    // never got to report it. Settle with the count the page actually
+    // reached, not the (likely zero) one in storage.
+    if (snap.done || !snap.alive) {
+        chrome.runtime.sendMessage({
+            type: "FINISHED",
+            count: snap.count,
+            stopped: snap.stopped || !snap.alive,
+        });
     }
 }
 
@@ -302,12 +287,11 @@ stopBtn.addEventListener("click", async () => {
 
 async function init() {
     await loadSettings();
-    await reconcileStaleRun();
+    await syncFromPage();
     refresh();
     // Keep reading straight from the page while the panel is open, so the
     // count and the finish still land even if messaging is dead.
-    pollRunState();
-    setInterval(pollRunState, 1000);
+    setInterval(syncFromPage, 1000);
 }
 
 // The script tag is at the end of <body>, so DOMContentLoaded may already
